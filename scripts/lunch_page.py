@@ -2,24 +2,38 @@
 
 workbench/day3/outputs/lunch_clean.csv 를 읽어 계산하고
 workbench/day3/outputs/hanbit_lunch.html 한 장을 쓴다(같은 입력이면 같은 페이지).
-지금 구역: 머리 · 영양사님 감 검증
+지금 구역: 머리 · 다음 주 예보 · 예보 성적표 · 영양사님 감 검증
 실행: uv run python scripts/lunch_page.py
 """
 
 import html
 import json
+import math
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+from lightgbm import LGBMRegressor
+from sklearn.linear_model import LinearRegression
 
 ROOT = Path(__file__).resolve().parents[1]
 CLEAN = ROOT / "workbench/day3/outputs/lunch_clean.csv"
 MEMO = ROOT / "labs/day3/lab-c/nutritionist_memo.md"
+PLAN = ROOT / "labs/day3/lab-c/next_week_plan.csv"
 OUT = ROOT / "workbench/day3/outputs/hanbit_lunch.html"
 
 GAP = 2.0  # 100명당 2명 — 사람이 정한 '차이 있음' 선
 CHART_JS = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+
+# 예보관 시험 — 안내서 「7」
+TEST_START = "2026-09-14"  # 이 날부터 시험 기간, 그 전은 배우는 기간
+TEXT_COLS = ["요일", "날씨", "메인메뉴", "행사"]
+FEATURES = ["요일", "날씨", "최고기온", "메인메뉴", "행사", "월급날", "출근예정"]
+MENU_MULT = {"돈가스": 1.1, "카레": 1.1, "샐러드": 0.9}  # 나머지 1.0
+AI_MARGIN = 10   # AI 준비 = 예보 + 10
+COST = 4500      # 1인분 원가(가정)
+MARKED = {"2026-09-23": "추석 연휴 전날 · 돈가스", "2026-09-30": "비 오는 수요일 · 카레"}
 
 
 # ---------------------------------------------------------------- 데이터
@@ -108,6 +122,132 @@ def belief_check(df: pd.DataFrame) -> dict:
     return {"cards": cards, "payday": payday, "base_days": int(len(base))}
 
 
+def round_half_up(x: float) -> int:
+    return int(math.floor(x + 0.5))
+
+
+def make_features(d: pd.DataFrame, temp_fill: float, columns=None) -> pd.DataFrame:
+    """재료 열 — 최고기온 빈칸은 배우는 기간의 가운데 값, 행사 빈칸은 '없음', 글자 열은 get_dummies."""
+    x = d[FEATURES].copy()
+    x["최고기온"] = x["최고기온"].fillna(temp_fill)
+    x["행사"] = x["행사"].replace("", "없음")
+    x = pd.get_dummies(x, columns=TEXT_COLS, dtype=int)
+    return x if columns is None else x.reindex(columns=columns, fill_value=0)
+
+
+def nutritionist_formula(df: pd.DataFrame, day: str, weekday: str, menu: str) -> float:
+    """그날 전 같은 요일의 실제 식수 4개(깨끗한 표, 가까운 날부터) 평균 × 메뉴 배수."""
+    prev = df[(df["날짜"] < day) & (df["요일"] == weekday)].sort_values("날짜").tail(4)
+    return float(prev["식수"].mean()) * MENU_MULT.get(menu, 1.0)
+
+
+def forecast_test(df: pd.DataFrame) -> dict:
+    train = df[df["날짜"] < TEST_START]
+    test = df[df["날짜"] >= TEST_START]
+    temp_fill = float(train["최고기온"].median())
+    X_train = make_features(train, temp_fill)
+    X_test = make_features(test, temp_fill, X_train.columns)
+    y_train, y_test = train["식수"], test["식수"].to_numpy()
+
+    models = {
+        "선형 회귀": LinearRegression(),
+        "LightGBM": LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=15,
+                                  min_child_samples=5, random_state=42, verbose=-1),
+    }
+    preds, scores = {}, {}
+    for name, m in models.items():
+        m.fit(X_train, y_train)
+        preds[name] = m.predict(X_test)
+        scores[name] = float(np.abs(preds[name] - y_test).mean())  # 하루 평균 몇 인분 차이
+    chosen = min(scores, key=scores.get)
+
+    formula = np.array([nutritionist_formula(df, r["날짜"], r["요일"], r["메인메뉴"])
+                        for _, r in test.iterrows()])
+    ai_pred = preds[chosen]
+    ai_prep = np.array([round_half_up(p) + AI_MARGIN for p in ai_pred])
+    nu_prep = np.array([round_half_up(f) for f in formula])
+
+    def outcome(prep, pred):
+        left = np.clip(prep - y_test, 0, None)
+        short = np.clip(y_test - prep, 0, None)
+        return {"mae": round(float(np.abs(pred - y_test).mean()), 1),
+                "left": int(left.sum()), "left_won": int(left.sum()) * COST,
+                "short": int(short.sum()), "short_days": int((short > 0).sum())}
+
+    days = []
+    for i, (_, r) in enumerate(test.iterrows()):
+        days.append({"date": r["날짜"], "label": f"{int(r['날짜'][5:7])}/{int(r['날짜'][8:10])}({r['요일']})",
+                     "actual": int(y_test[i]), "ai": round(float(ai_pred[i]), 1),
+                     "ai_prep": int(ai_prep[i]), "formula": round(float(formula[i]), 1),
+                     "formula_prep": int(nu_prep[i]), "menu": r["메인메뉴"],
+                     "mark": MARKED.get(r["날짜"], "")})
+
+    return {"train_days": int(len(train)), "test_days": int(len(test)),
+            "test_start": test["날짜"].min(), "test_end": test["날짜"].max(),
+            "scores": {k: round(v, 1) for k, v in scores.items()}, "chosen": chosen,
+            "ai": outcome(ai_prep, ai_pred), "formula": outcome(nu_prep, formula), "days": days,
+            # 다음 단계에서 같은 예보관에게 묻기 위해(페이지 JSON에는 넣지 않음)
+            "_model": models[chosen], "_columns": X_train.columns, "_temp_fill": temp_fill}
+
+
+def next_week(df: pd.DataFrame, ft: dict, bc: dict) -> list[dict]:
+    """다음 주 계획을 우리 예보관에게 묻는다 — 안내서 「8」."""
+    plan = pd.read_csv(PLAN, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    plan = plan.rename(columns={"날씨예보": "날씨", "최고기온예보": "최고기온"})
+    plan["최고기온"] = pd.to_numeric(plan["최고기온"].replace("", None), errors="coerce")
+    plan["월급날"] = plan["월급날"].str.strip().map({"Y": 1, "": 0}).astype(int)
+    plan["출근예정"] = plan["출근예정"].astype(int)
+    plan["행사"] = plan["행사"].str.strip()
+    X = make_features(plan, ft["_temp_fill"], ft["_columns"])
+    preds = ft["_model"].predict(X)
+
+    # 코멘트 근거 — 감 검증에서 계산한 숫자
+    cards = {c["no"]: c for c in bc["cards"]}
+    rain, sunny = cards[1]["groups"]
+    fri, mon_thu = cards[2]["groups"]
+    pay, normal = bc["payday"]["groups"]
+
+    out = []
+    for (_, r), p in zip(plan.iterrows(), preds):
+        fc = round_half_up(float(p))
+        formula = nutritionist_formula(df, r["날짜"], r["요일"], r["메인메뉴"])
+        f_prep = round_half_up(formula)
+        diff = fc - f_prep
+
+        cond = f'{r["요일"]}요일 · {r["날씨"]} · {r["메인메뉴"]}'
+        if r["행사"]:
+            cond += f' · {r["행사"]}'
+        if r["월급날"] and r["요일"] == "금":
+            hint = (f'금요일이면서 월급날이에요 — 금요일은 월–목보다 {mon_thu["value"] - fri["value"]:.1f}명, '
+                    f'월급날은 보통 날보다 {normal["value"] - pay["value"]:.1f}명(출근 100명당) 적게 오셨어요.')
+        elif r["월급날"]:
+            hint = f'월급날은 보통 날보다 출근 100명당 {normal["value"] - pay["value"]:.1f}명 적게 오셨어요.'
+        elif r["날씨"] == "비":
+            hint = f'비 오는 날은 맑은 날보다 출근 100명당 {rain["value"] - sunny["value"]:.1f}명 많이 오셨어요.'
+        elif r["요일"] == "금":
+            hint = f'금요일은 월–목보다 출근 100명당 {mon_thu["value"] - fri["value"]:.1f}명 적게 오셨어요.'
+        elif r["행사"]:
+            hint = f'{r["행사"]} 날이라 출근 인원이 {r["출근예정"]}명으로 잡혀 있어요.'
+        else:
+            hint = ""
+        if diff == 0:
+            gap = "영양사님 공식과 같은 숫자예요."
+        else:
+            gap = f'영양사님 공식보다 {abs(diff)}명 {"많게" if diff > 0 else "적게"} 봤어요.'
+        comment = f"{cond}. {hint} {gap}".replace("  ", " ")
+
+        out.append({"date": r["날짜"], "md": f'{int(r["날짜"][5:7])}/{int(r["날짜"][8:10])}',
+                    "weekday": r["요일"], "weather": r["날씨"], "menu": r["메인메뉴"],
+                    "event": r["행사"], "payday": int(r["월급날"]), "attend": int(r["출근예정"]),
+                    "raw": round(float(p), 1), "forecast": fc, "prep": fc + AI_MARGIN,
+                    "formula": round(formula, 1), "formula_prep": f_prep, "diff": diff,
+                    "comment": comment, "flag": ""})
+    hi = max(out, key=lambda d: d["forecast"])
+    lo = min(out, key=lambda d: d["forecast"])
+    hi["flag"], lo["flag"] = "이번 주 가장 많은 날", "이번 주 가장 적은 날"
+    return out
+
+
 # ---------------------------------------------------------------- 페이지 조각
 def esc(s) -> str:
     return html.escape(str(s))
@@ -160,6 +300,80 @@ def section_belief(bc: dict) -> str:
             f'</section>')
 
 
+def section_next_week(nw: list[dict], chosen: str) -> str:
+    cards = []
+    for d in nw:
+        chips = [d["weather"], d["menu"]] + ([d["event"]] if d["event"] else []) + (["월급날"] if d["payday"] else [])
+        flag_cls = "hi" if "많은" in d["flag"] else "lo"
+        flag = f'<span class="flag {flag_cls}">{esc(d["flag"])}</span>' if d["flag"] else ""
+        cards.append(
+            f'<article class="card day{" " + flag_cls if d["flag"] else ""}">'
+            f'<div class="day-top"><span class="date">{esc(d["md"])} <b>{esc(d["weekday"])}</b></span>{flag}</div>'
+            f'<p class="big">{d["forecast"]}<small>명</small></p>'
+            f'<p class="prep">준비 {d["prep"]}인분</p>'
+            f'<p class="formula">영양사님 공식이면 {d["formula_prep"]}인분</p>'
+            f'<div class="chips">{"".join(f"<span class=chip>{esc(c)}</span>" for c in chips)}</div>'
+            f'<p class="comment">{esc(d["comment"])}</p>'
+            f'</article>')
+    first, last = nw[0]["date"], nw[-1]["date"]
+    return (f'<section id="next-week">'
+            f'<h2>다음 주 예보</h2>'
+            f'<p class="lead"><span class="nw">{first}</span> – <span class="nw">{last}</span> · 우리 예보관({esc(chosen)})의 예보입니다. '
+            f'준비는 예보 + {AI_MARGIN}인분. 준비량은 영양사님이 정해 주세요.</p>'
+            f'<div class="week">{"".join(cards)}</div>'
+            f'</section>')
+
+
+def section_forecast(ft: dict) -> str:
+    s, chosen = ft["scores"], ft["chosen"]
+    other = next(k for k in s if k != chosen)
+    score_cards = "".join(
+        f'<div class="score{" pick" if k == chosen else ""}">'
+        f'<span class="l">{esc(k)}</span>'
+        f'<span class="n">{v:.1f}<small>인분</small></span>'
+        f'<span class="l">하루 평균 차이</span>'
+        + ('<span class="badge ok">우리 예보관</span>' if k == chosen else "")
+        + '</div>'
+        for k, v in s.items())
+
+    marks = "".join(
+        f'<li><b>{esc(d["label"])} {esc(d["mark"])}</b> — 실제 {d["actual"]}명 · '
+        f'우리 예보관 {d["ai"]:.0f}명(준비 {d["ai_prep"]}) · 영양사님 공식 {d["formula_prep"]}인분</li>'
+        for d in ft["days"] if d["mark"])
+
+    ai, nu = ft["ai"], ft["formula"]
+
+    def pair(title, a_main, a_sub, n_main, n_sub, better_ai):
+        def side(name, main, sub, win):
+            return (f'<div class="side{" win" if win else ""}"><span class="l">{name}</span>'
+                    f'<span class="n">{main}</span><span class="l">{sub}</span></div>')
+        return (f'<article class="card"><p class="belief">{title}</p><div class="pair">'
+                f'{side("AI", a_main, a_sub, better_ai)}{side("영양사님 공식", n_main, n_sub, not better_ai)}'
+                f'</div></article>')
+
+    cards = (
+        pair("하루 평균 몇 인분 차이", f'{ai["mae"]:.1f}', "인분", f'{nu["mae"]:.1f}', "인분", ai["mae"] < nu["mae"])
+        + pair("남은 밥 (20일 합계)", f'{ai["left"]:,}', f'인분 · {ai["left_won"]:,}원',
+               f'{nu["left"]:,}', f'인분 · {nu["left_won"]:,}원', ai["left"] < nu["left"])
+        + pair("모자란 밥 = 컵라면을 드신 분", f'{ai["short"]:,}', f'인분 · 모자란 날 {ai["short_days"]}일',
+               f'{nu["short"]:,}', f'인분 · 모자란 날 {nu["short_days"]}일', ai["short"] < nu["short"])
+    )
+
+    return (f'<section id="forecast">'
+            f'<h2>예보 성적표</h2>'
+            f'<p class="lead"><span class="nw">{ft["test_start"]}</span> 전 {ft["train_days"]}일로 배우고, '
+            f'<span class="nw">{ft["test_start"]}</span> – <span class="nw">{ft["test_end"]}</span> {ft["test_days"]}일은 배울 때 쓰지 않고 시험만 봤습니다.</p>'
+            f'<div class="scores">{score_cards}</div>'
+            f'<p class="note">복잡한 쪽이 늘 이기지는 않는다 — 시험으로 고른다. '
+            f'{esc(chosen)}가 {esc(other)}보다 하루 평균 {abs(s[other] - s[chosen]):.1f}인분 덜 틀렸습니다. 설정은 모두 같은 결과를 보려고 고정했습니다.</p>'
+            f'<article class="card wide"><p class="belief">시험 {ft["test_days"]}일 — 실제 · 우리 예보관 · 영양사님 공식</p>'
+            f'<div class="chart" style="height:300px"><canvas id="testLine" aria-label="시험 기간 식수 선 그래프"></canvas></div>'
+            f'<ul class="marks">{marks}</ul></article>'
+            f'<p class="lead">준비는 AI = 예보 + {AI_MARGIN}인분, 영양사님 = 공식(반올림). 남은 밥 1인분 원가 {COST:,}원(가정).</p>'
+            f'<div class="grid three">{cards}</div>'
+            f'</section>')
+
+
 def head_html(df: pd.DataFrame) -> str:
     start, end = df["날짜"].min(), df["날짜"].max()
     return (f'<header>'
@@ -198,6 +412,37 @@ h2{font-size:22px;margin:0 0 8px}
 .diff,.note{margin:8px 0 0;font-size:14px;color:var(--ink2)}
 .chart{position:relative;margin-top:12px;width:100%}
 .nw{white-space:nowrap}
+.scores{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));gap:16px}
+.score{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;
+display:flex;flex-direction:column;align-items:flex-start;gap:2px}
+.score.pick{border:2px solid var(--accent)}
+.score .n small,.side .n small{font-size:16px;font-weight:400;margin-left:4px}
+.score .badge{margin-top:8px}
+.card.wide{margin-top:16px}
+.marks{margin:12px 0 0;padding-left:20px;font-size:14px;color:var(--ink2)}
+.marks b{color:var(--ink)}
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.side{display:flex;flex-direction:column;padding:8px 12px;border-radius:8px;background:var(--bg);min-width:0}
+.side.win{box-shadow:inset 3px 0 0 var(--accent)}
+.grid.three{grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+.week{display:grid;grid-template-columns:1fr;gap:12px}
+@media (min-width:900px){.week{grid-template-columns:repeat(5,minmax(0,1fr))}}
+.day{display:flex;flex-direction:column;gap:4px}
+.day.hi{border:2px solid var(--accent)}
+.day.lo{border:2px solid var(--gray)}
+.day-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap}
+.date{font-size:16px;color:var(--ink2)}
+.date b{color:var(--ink)}
+.flag{font-size:14px;font-weight:700;padding:0 8px;border-radius:999px;color:#fff;white-space:nowrap}
+.flag.hi{background:var(--accent)}
+.flag.lo{background:var(--gray)}
+.big{font-size:40px;font-weight:700;line-height:1.1;margin:8px 0 0;font-variant-numeric:tabular-nums}
+.big small{font-size:18px;font-weight:400;margin-left:2px}
+.prep{font-size:18px;font-weight:700;margin:0}
+.formula{font-size:14px;color:var(--ink2);margin:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{font-size:14px;padding:0 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg)}
+.comment{font-size:14px;color:var(--ink2);margin:8px 0 0}
 """
 
 JS = """
@@ -225,13 +470,37 @@ D.belief.cards.forEach(c=>{
   else bars('belief'+c.no, c.groups, (g)=>g===c.groups[0]);
 });
 bars('payday', D.belief.payday.groups, g=>g===D.belief.payday.groups[0]);
+(function(){
+  const el = document.getElementById('testLine'); if(!el) return;
+  const F = D.forecast, days = F.days;
+  const big = days.map(d=>d.mark?7:3);
+  new Chart(el, {type:'line',
+    data:{labels:days.map(d=>d.mark?d.label+' *':d.label),
+      datasets:[
+        {label:'실제', data:days.map(d=>d.actual), borderColor:C('--ink'), backgroundColor:C('--ink'),
+         borderWidth:2, pointRadius:big, pointHoverRadius:8, tension:0},
+        {label:'우리 예보관('+F.chosen+')', data:days.map(d=>d.ai), borderColor:C('--accent'), backgroundColor:C('--accent'),
+         borderWidth:2, pointRadius:big, pointHoverRadius:8, tension:0},
+        {label:'영양사님 공식', data:days.map(d=>d.formula), borderColor:C('--gray'), backgroundColor:C('--gray'),
+         borderWidth:2, borderDash:[6,4], pointRadius:big, pointHoverRadius:8, tension:0}]},
+    options:{responsive:true, maintainAspectRatio:false, animation:false,
+      interaction:{mode:'index', intersect:false},
+      plugins:{legend:{position:'top', align:'start', labels:{boxWidth:16, boxHeight:2}},
+        tooltip:{callbacks:{
+          title:items=>{const d=days[items[0].dataIndex]; return d.label+' · '+d.menu+(d.mark?' · '+d.mark:'');},
+          label:c=>`${c.dataset.label}: ${Math.round(c.parsed.y)}명`}}},
+      scales:{x:{grid:{display:false}, ticks:{maxRotation:0, autoSkip:true, maxTicksLimit:7}},
+              y:{grid:{color:C('--line')}, ticks:{maxTicksLimit:6}}}}});
+})();
 """
 
 
-def build_page(df: pd.DataFrame, bc: dict) -> str:
-    data = {"belief": {"cards": bc["cards"], "payday": bc["payday"]}}
+def build_page(df: pd.DataFrame, bc: dict, ft: dict, nw: list[dict]) -> str:
+    data = {"belief": {"cards": bc["cards"], "payday": bc["payday"]},
+            "forecast": {"chosen": ft["chosen"], "days": ft["days"]},
+            "next_week": nw}
     data_json = json.dumps(data, ensure_ascii=False, sort_keys=True).replace("</", "<\\/")
-    sections = [section_belief(bc)]  # 다음 단계에서 구역을 더한다
+    sections = [section_next_week(nw, ft["chosen"]), section_forecast(ft), section_belief(bc)]  # 머리 바로 아래부터 이 순서
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -259,7 +528,26 @@ def build_page(df: pd.DataFrame, bc: dict) -> str:
 def main() -> None:
     df = load_clean()
     bc = belief_check(df)
-    OUT.write_text(build_page(df, bc), encoding="utf-8")
+    ft = forecast_test(df)
+    nw = next_week(df, ft, bc)
+    OUT.write_text(build_page(df, bc, ft, nw), encoding="utf-8")
+
+    print(f"다음 주 예보 — 우리 예보관 {ft['chosen']}")
+    for d in nw:
+        print(f"  {d['date']}({d['weekday']}) 예보 {d['raw']:.1f} → {d['forecast']}명 · 준비 {d['prep']}인분 · "
+              f"공식 {d['formula']:.1f} → {d['formula_prep']}인분 · 차이 {d['diff']:+d}" + (f"  [{d['flag']}]" if d["flag"] else ""))
+        print(f"    {d['comment']}")
+
+    print(f"예보 성적표 — 배우는 기간 {ft['train_days']}일 · 시험 기간 {ft['test_days']}일({ft['test_start']} – {ft['test_end']})")
+    for k, v in ft["scores"].items():
+        print(f"  {k}: 하루 평균 {v:.1f}인분 차이" + ("  ← 우리 예보관" if k == ft["chosen"] else ""))
+    for name, o in (("AI", ft["ai"]), ("영양사님 공식", ft["formula"])):
+        print(f"  {name}: 평균 차이 {o['mae']:.1f} · 남은 밥 {o['left']}인분({o['left_won']:,}원) · "
+              f"모자란 밥 {o['short']}인분 · 모자란 날 {o['short_days']}일")
+    for d in ft["days"]:
+        if d["mark"]:
+            print(f"  {d['date']} {d['mark']}: 실제 {d['actual']} · AI 예보 {d['ai']:.1f}(준비 {d['ai_prep']}) · "
+                  f"공식 {d['formula']:.1f}(준비 {d['formula_prep']})")
 
     print(f"감 검증 — 기준 날(행사 없고 월급날 아님) {bc['base_days']}일, 출근 100명당 식수")
     for c in bc["cards"]:
